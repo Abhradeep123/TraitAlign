@@ -177,24 +177,8 @@ TraitAlign (gcn)     | ...     | ...     | ...      | ...      | ...     | ...
 
 Full results on the three benchmarks are reported in the accompanying paper.
 
----
-
-## Citation
-
-If you find this work useful in your research, please cite:
-
-```bibtex
-@misc{traitalign2026,
-  title   = {TraitAlign: Personality-Aware Graph Neural Network Recommender System},
-  author  = {Himanshu Mandal},
-  year    = {2026},
-  note    = {https://github.com/himanshu7d3/TraitAlign}
-}
-```
-
----
 
 ## License
 
 This project is licensed under the [MIT License](LICENSE).  
-© 2026 Himanshu Mandal
+© 2026 Abhradeep Dutta || Himanshu Mandal
