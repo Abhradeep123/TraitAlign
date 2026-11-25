@@ -1,0 +1,28 @@
+# Core Machine Learning & Data Processing
+numpy>=1.24.0
+scipy>=1.10.0
+pandas>=2.0.0
+scikit-learn>=1.2.0
+
+# Deep Learning (PyTorch)
+torch>=2.0.0
+
+# Graph Neural Networks (PyTorch Geometric)
+torch_geometric>=2.4.0
+
+# NLP & Sentence Embeddings
+sentence-transformers>=2.2.0
+
+# Hyperparameter Optimization & Experimentation
+optuna>=3.0.0
+tqdm>=4.65.0
+
+# Dataset Downloads
+kagglehub>=0.2.0
+
+# Optional PyG C++ acceleration extensions (install matching your PyTorch/CUDA version):
+# pyg_lib
+# torch_scatter
+# torch_sparse
+# torch_cluster
+# torch_spline_conv
