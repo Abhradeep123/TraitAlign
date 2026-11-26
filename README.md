@@ -25,7 +25,7 @@ The key insight is that **how** a user interacts — their diversity, novelty-se
 ## Highlights
 
 - 🧠 **Personality-aware alignment loss** — contrastive objective that aligns GNN embedding similarity with behavioural-proxy similarity
-- 🔗 **Heterogeneous GNN backbone** — supports GCN, GAT, and GraphSAGE on a bipartite user-item graph
+- 🔗 **Heterogeneous GAT backbone** — 2-layer heterogeneous GAT encoder with residual skip connections on a bipartite user-item graph
 - 📐 **Dataset-agnostic proxy engine** — computes six behavioural dimensions from any interaction table using unsupervised item clustering
 - 🤖 **MiniLM side-information encoding** — `all-MiniLM-L6-v2` text embeddings for occupation labels, country names, and item metadata
 - ⚡ **Optuna HPO** — automated hyperparameter optimisation with TPE sampler
@@ -57,8 +57,8 @@ TraitAlign/
 │   ├── preprocessing.py   # Behavioural-proxy engine & MiniLM preprocessing
 │   ├── embeddings.py      # Item embedding generation pipeline
 │   ├── data_loading.py    # Dataset loaders & train/val/test splitting
-│   ├── models.py          # GNN architectures & TraitAlign model
-│   ├── training.py        # Training loops (TraitAlign + baseline)
+│   ├── models.py          # Heterogeneous GAT & TraitAlign model
+│   ├── training.py        # Optuna training loop for TraitAlign (GAT)
 │   ├── evaluation.py      # Full-ranking metrics (HR / NDCG / MRR)
 │   ├── utils.py           # Seed utilities
 │   ├── __init__.py
@@ -121,9 +121,9 @@ python -m traitalign
 This will automatically:
 1. Download all required raw datasets
 2. Run preprocessing and behavioural-proxy computation
-3. Generate MiniLM item/side-information embeddings
-4. Launch Optuna hyperparameter optimisation for GCN, GAT, and GraphSAGE backbones
-5. Evaluate the best TraitAlign model against the MTL baseline
+3. Generate MiniLM item embeddings (`P_i.npy`, skipped if already present)
+4. Launch Optuna hyperparameter optimisation for the GAT backbone
+5. Evaluate the best TraitAlign (GAT) model on the test split
 6. Print a summary results table
 
 ### Environment Variables
@@ -133,12 +133,16 @@ This will automatically:
 | `TRAITALIGN_SEED` | `42` | Global random seed |
 | `TRAITALIGN_DATASET` | `personality18` | Dataset to use (`personality18`, `movielens`, `lastfm`) |
 | `TRAITALIGN_DATA_DIR` | `Datasets/traitalign-personality18` | Path to preprocessed data |
-| `TRAITALIGN_DRY_RUN` | `1` | Set to `0` for full training (100 epochs, 20 Optuna trials) |
+| `TRAITALIGN_DRY_RUN` | `0` | Set to `1` for a quick dry run (2 epochs, 2 Optuna trials) instead of full training (100 epochs, 20 trials) |
 
-**Example — full training run:**
+**Example — custom seed & dry-run smoke test:**
 
 ```bash
-TRAITALIGN_DRY_RUN=0 TRAITALIGN_SEED=123 python -m traitalign
+# Full training (default)
+TRAITALIGN_SEED=123 python -m traitalign
+
+# Quick dry run (2 epochs, 2 Optuna trials)
+TRAITALIGN_DRY_RUN=1 python -m traitalign
 ```
 
 **SLURM / HPC:**
@@ -158,25 +162,9 @@ python -m traitalign
 - **Split**: per-user random 80 / 10 / 10 edge-level split; users with fewer than 5 interactions are train-only
 - **Metrics**: HR@10, HR@20, NDCG@10, NDCG@20, MRR@10, MRR@20
 - **Masking**: training (and validation) items are masked at test time to prevent leakage
-- **Backbones evaluated**: GCN, GAT, GraphSAGE
+- **Backbone evaluated**: GAT
 
 ---
-
-## Results (Dry Run / Smoke Test)
-
-Running `python -m traitalign` (dry run, 2 epochs) produces a per-backbone summary table:
-
-```
-=========================================================================================
-Model                | HR@10   | HR@20   | NDCG@10  | NDCG@20  | MRR@10  | MRR@20
------------------------------------------------------------------------------------------
-Baseline (gcn)       | ...     | ...     | ...      | ...      | ...     | ...
-TraitAlign (gcn)     | ...     | ...     | ...      | ...      | ...     | ...
-=========================================================================================
-```
-
-Full results on the three benchmarks are reported in the accompanying paper.
-
 
 ## License
 
