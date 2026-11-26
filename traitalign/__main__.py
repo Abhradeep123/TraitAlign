@@ -33,7 +33,7 @@ def main() -> None:
     from .downloaders import download_all
     from .evaluation import evaluate_full
     from .models import TraitAlignWrapper
-    from .training import run_baseline_model, run_optuna_trial, _full_forward
+    from .training import run_optuna_trial, _full_forward
     from .utils import set_seed
 
     print("PyTorch Version:", torch.__version__)
@@ -48,9 +48,12 @@ def main() -> None:
     preprocessor.run_all()
 
     # ---- 3. Generate embeddings (only needed once) ----------------------
-    from .embeddings import EmbeddingGenerator
-    generator = EmbeddingGenerator()
-    generator.run()
+    if not os.path.exists("P_i.npy"):
+        from .embeddings import EmbeddingGenerator
+        generator = EmbeddingGenerator()
+        generator.run()
+    else:
+        print("P_i.npy already exists, skipping embedding generation.")
 
     # ---- 4. Experiment configuration ------------------------------------
     SEED = int(os.environ.get("TRAITALIGN_SEED", 42))
@@ -58,92 +61,80 @@ def main() -> None:
 
     DATASET_NAME = os.environ.get("TRAITALIGN_DATASET", "personality18")
     DATA_DIR = os.environ.get("TRAITALIGN_DATA_DIR", r"Datasets/traitalign-personality18")
-    DRY_RUN = os.environ.get("TRAITALIGN_DRY_RUN", "1").lower() in ("1", "true", "yes")
+    DRY_RUN = os.environ.get("TRAITALIGN_DRY_RUN", "0").lower() in ("1", "true", "yes")
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    gnn_types = ["gcn", "gat", "graphsage"]
+    print(f"\n🚀 STARTING EXPERIMENT (seed={SEED}, gnn=gat) 🚀")
+    dataset = load_traitalign_dataset(DATASET_NAME, DATA_DIR)
+    print("✅ Real data loaded successfully!")
 
-    for gnn_type in gnn_types:
-        set_seed(SEED)  # re-seed per GNN for independent reproducibility
+    # ---- Optuna HPO -----------------------------------------------------
+    n_trials = 2 if DRY_RUN else 20
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=SEED),
+    )
+    study.optimize(
+        lambda trial: run_optuna_trial(
+            trial, dataset, dry_run=DRY_RUN, device=device, seed=SEED,
+        ),
+        n_trials=n_trials,
+    )
 
-        print(f"\n🚀 STARTING EXPERIMENT (seed={SEED}, gnn={gnn_type}) 🚀")
-        dataset = load_traitalign_dataset(DATASET_NAME, DATA_DIR)
-        print("✅ Real data loaded successfully!")
+    print(f"\n🎉 TRAITALIGN TUNING COMPLETE 🎉")
+    print(f"Best TraitAlign Validation NDCG@10: {study.best_value:.4f}")
+    print(f"Best TraitAlign model saved to: best_full_gat_model_seed{SEED}.pth")
 
-        # ---- Optuna HPO -------------------------------------------------
-        n_trials = 2 if DRY_RUN else 20
-        study = optuna.create_study(
-            direction="maximize",
-            sampler=optuna.samplers.TPESampler(seed=SEED),
-        )
-        study.optimize(
-            lambda trial: run_optuna_trial(
-                trial, dataset, gnn_type, dry_run=DRY_RUN, seed=SEED,
-            ),
-            n_trials=n_trials,
-        )
+    # Save best hyper-parameters
+    hparams = {
+        "seed": SEED,
+        "gnn_type": "gat",
+        "dataset": DATASET_NAME,
+        "best_value_ndcg10": study.best_value,
+        "best_params": study.best_params,
+    }
+    hparams_path = f"best_hparams_full_gat_seed{SEED}.json"
+    with open(hparams_path, "w") as f:
+        json.dump(hparams, f, indent=2)
+    print(f"Best hyperparameters saved to: {hparams_path}")
 
-        print(f"\n🎉 TRAITALIGN TUNING COMPLETE 🎉")
-        print(f"Best TraitAlign Validation NDCG@10: {study.best_value:.4f}")
-        print(f"Best TraitAlign model saved to: best_full_{gnn_type}_model_seed{SEED}.pth")
+    # ---- Evaluate best TraitAlign model ---------------------------------
+    best_model = TraitAlignWrapper(
+        num_users=dataset["num_users"],
+        num_items=dataset["num_items"],
+        embed_dim=64,
+        minilm_dim=dataset["minilm_vec"].shape[1],
+        scalar_dim=dataset["scalar_vec"].shape[1],
+        out_dim=dataset["true_proxies"].shape[1],
+    ).to(device)
+    best_model.load_state_dict(
+        torch.load(f"best_full_gat_model_seed{SEED}.pth", map_location=device),
+    )
+    best_model.eval()
+    with torch.no_grad():
+        out_eval = _full_forward(best_model, dataset["data"], device)
 
-        # Save best hyper-parameters
-        hparams = {
-            "seed": SEED,
-            "gnn_type": gnn_type,
-            "dataset": DATASET_NAME,
-            "best_value_ndcg10": study.best_value,
-            "best_params": study.best_params,
-        }
-        hparams_path = f"best_hparams_full_{gnn_type}_seed{SEED}.json"
-        with open(hparams_path, "w") as f:
-            json.dump(hparams, f, indent=2)
-        print(f"Best hyperparameters saved to: {hparams_path}")
+    traitalign_metrics = evaluate_full(
+        out_eval["user"], out_eval["item"],
+        dataset["train_edge_index"].to(device),
+        dataset["val_dict"], dataset["test_dict"],
+        k_list=(10, 20),
+    )
 
-        # ---- Evaluate best TraitAlign model -----------------------------
-        best_model = TraitAlignWrapper(
-            num_users=dataset["num_users"],
-            num_items=dataset["num_items"],
-            gnn_type=gnn_type,
-            embed_dim=64,
-            minilm_dim=dataset["minilm_vec"].shape[1],
-            scalar_dim=dataset["scalar_vec"].shape[1],
-            out_dim=dataset["true_proxies"].shape[1],
-        ).to(device)
-        best_model.load_state_dict(
-            torch.load(f"best_full_{gnn_type}_model_seed{SEED}.pth"),
-        )
-        best_model.eval()
-        with torch.no_grad():
-            out_eval = _full_forward(best_model, dataset["data"], device)
-
-        traitalign_metrics = evaluate_full(
-            out_eval["user"], out_eval["item"],
-            dataset["train_edge_index"].to(device),
-            dataset["val_dict"], dataset["test_dict"],
-            k_list=(10, 20),
-        )
-
-        # ---- Train & evaluate baseline ----------------------------------
-        baseline_metrics, _ = run_baseline_model(
-            dataset, gnn_type, dataset_name=DATASET_NAME, dry_run=DRY_RUN,
+    # ---- Summary table --------------------------------------------------
+    def _fmt(m: dict) -> str:
+        return (
+            f"{m['HR@10']:.4f}  | {m['HR@20']:.4f}  | "
+            f"{m['NDCG@10']:.4f}  | {m['NDCG@20']:.4f}  | "
+            f"{m['MRR@10']:.4f}  | {m['MRR@20']:.4f}"
         )
 
-        # ---- Summary table ----------------------------------------------
-        def _fmt(m: dict) -> str:
-            return (
-                f"{m['HR@10']:.4f}  | {m['HR@20']:.4f}  | "
-                f"{m['NDCG@10']:.4f}  | {m['NDCG@20']:.4f}  | "
-                f"{m['MRR@10']:.4f}  | {m['MRR@20']:.4f}"
-            )
-
-        print(f"\n🔥 EXPERIMENT FULL SUMMARY (seed={SEED}) 🔥")
-        print("=" * 91)
-        print(f"{'Model':<20} | {'HR@10':<7} | {'HR@20':<7} | {'NDCG@10':<7} | {'NDCG@20':<7} | {'MRR@10':<7} | {'MRR@20':<7}")
-        print("-" * 91)
-        print(f"{'Baseline ('+gnn_type+')':<20} | " + _fmt(baseline_metrics))
-        print(f"{'TraitAlign ('+gnn_type+')':<20} | " + _fmt(traitalign_metrics))
-        print("=" * 91)
+    print(f"\n🔥 EXPERIMENT FULL SUMMARY (seed={SEED}) 🔥")
+    print("=" * 91)
+    print(f"{'Model':<20} | {'HR@10':<7} | {'HR@20':<7} | {'NDCG@10':<7} | {'NDCG@20':<7} | {'MRR@10':<7} | {'MRR@20':<7}")
+    print("-" * 91)
+    print(f"{'TraitAlign (gat)':<20} | " + _fmt(traitalign_metrics))
+    print("=" * 91)
 
 
 if __name__ == "__main__":

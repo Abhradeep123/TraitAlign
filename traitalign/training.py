@@ -1,6 +1,5 @@
 """
-Training loops: Optuna-based hyperparameter tuning (TraitAlign) and the
-paper's MTL baseline.
+Training loop: Optuna-based hyperparameter tuning for TraitAlign (GAT).
 """
 from __future__ import annotations
 
@@ -8,16 +7,15 @@ import copy
 import time
 
 import torch
-import torch.nn.functional as F
 from torch_geometric.loader import LinkNeighborLoader
 from tqdm.auto import tqdm
 
-from .evaluation import evaluate_full, val_ndcg_full
-from .models import BaselineMTLWrapper, TraitAlignWrapper
+from .evaluation import val_ndcg_full
+from .models import TraitAlignWrapper
 
 
-# Module-level best-NDCG tracker (reset per experiment if needed)
-BEST_NDCG_BY_TYPE: dict[str, float] = {}
+# Module-level best-NDCG tracker per seed (reset per experiment if needed)
+BEST_NDCG_BY_SEED: dict[int, float] = {}
 
 
 # =========================================================================
@@ -73,8 +71,7 @@ def _collect_full_edge_weights(data, device):
     return ew or None
 
 
-def _full_forward(model, data, device, *, needs_side_info: bool = False,
-                  minilm_vec=None, scalar_vec=None):
+def _full_forward(model, data, device):
     """Run a full-graph forward pass (eval mode, no grad)."""
     x_dict_all = {
         "user": data["user"].n_id.to(device),
@@ -82,9 +79,6 @@ def _full_forward(model, data, device, *, needs_side_info: bool = False,
     }
     safe_ei = {k: v.to(device) for k, v in data.edge_index_dict.items()}
     ew = _collect_full_edge_weights(data, device)
-
-    if needs_side_info:
-        return model(x_dict_all, safe_ei, minilm_vec, scalar_vec, ew)
     return model(x_dict_all, safe_ei, ew)
 
 
@@ -95,12 +89,11 @@ def _full_forward(model, data, device, *, needs_side_info: bool = False,
 def run_optuna_trial(
     trial,
     dataset_dict: dict,
-    gnn_type: str,
     dry_run: bool = True,
     device: str = "cuda",
     seed: int = 42,
 ) -> float:
-    global BEST_NDCG_BY_TYPE
+    global BEST_NDCG_BY_SEED
     torch.cuda.empty_cache()
 
     lambda_beh_cont = trial.suggest_float("lambda_beh_cont", 1e-4, 1.0, log=True)
@@ -117,7 +110,6 @@ def run_optuna_trial(
     model = TraitAlignWrapper(
         num_users=dataset_dict["num_users"],
         num_items=dataset_dict["num_items"],
-        gnn_type=gnn_type,
         embed_dim=64,
         minilm_dim=dataset_dict["minilm_vec"].shape[1],
         scalar_dim=dataset_dict["scalar_vec"].shape[1],
@@ -207,157 +199,8 @@ def run_optuna_trial(
 
     print(f"Trial Finished | Time: {time.time() - t0:.1f}s | Best Val NDCG@10: {best_val_ndcg:.4f}")
 
-    if best_val_ndcg > BEST_NDCG_BY_TYPE.get(gnn_type, -1.0):
-        BEST_NDCG_BY_TYPE[gnn_type] = best_val_ndcg
-        torch.save(best_model_state, f"best_full_{gnn_type}_model_seed{seed}.pth")
+    if best_val_ndcg > BEST_NDCG_BY_SEED.get(seed, -1.0):
+        BEST_NDCG_BY_SEED[seed] = best_val_ndcg
+        torch.save(best_model_state, f"best_full_gat_model_seed{seed}.pth")
 
     return best_val_ndcg
-
-
-# =========================================================================
-# Baseline (MTL, no alignment loss)
-# =========================================================================
-
-def run_baseline_model(
-    dataset_dict: dict,
-    gnn_type: str,
-    dataset_name: str = "",
-    dry_run: bool = True,
-    device: str = "cuda",
-) -> tuple[dict, None]:
-    print(f"\n==========================================")
-    print(f"🚀 RUNNING FEATURE AWARE PAPER BASELINE ({gnn_type.upper()}) 🚀")
-    print(f"==========================================")
-
-    torch.cuda.empty_cache()
-    data = dataset_dict["data"]
-    train_loader = _build_train_loader(data)
-
-    # Normalised side-info
-    raw_minilm = dataset_dict["minilm_vec"].to(device)
-    if raw_minilm.shape[1] > 0:
-        minilm_full = (raw_minilm - raw_minilm.mean(0)) / (raw_minilm.std(0) + 1e-6)
-    else:
-        minilm_full = raw_minilm
-
-    raw_scalar = dataset_dict["scalar_vec"].to(device)
-    scalar_full = (raw_scalar - raw_scalar.mean(0)) / (raw_scalar.std(0) + 1e-6)
-    proxies_full = dataset_dict["true_proxies"].to(device)
-
-    embed_dim = 5 if "personality" in dataset_name.lower() else 64
-    model = BaselineMTLWrapper(
-        num_users=dataset_dict["num_users"],
-        num_items=dataset_dict["num_items"],
-        gnn_type=gnn_type,
-        embed_dim=embed_dim,
-        minilm_dim=dataset_dict["minilm_vec"].shape[1],
-        scalar_dim=dataset_dict["scalar_vec"].shape[1],
-        out_dim=dataset_dict["true_proxies"].shape[1],
-    ).to(device)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
-    lambda_aux = 0.0  # baseline = no alignment / similarity-matching losses
-
-    epochs = 2 if dry_run else 100
-    best_val_ndcg = -1.0
-    best_model_state = None
-    patience = 0
-    t0 = time.time()
-
-    for epoch in range(1, epochs + 1):
-        model.train()
-        epoch_loss = 0.0
-        pbar = tqdm(train_loader, desc=f"Baseline Epoch {epoch}/{epochs}", leave=False)
-
-        for batch in pbar:
-            batch = batch.to(device)
-            optimizer.zero_grad()
-
-            x_batch = {"user": batch["user"].n_id, "item": batch["item"].n_id}
-            safe_ei, ew = _safe_edge_dicts(batch)
-
-            g_users_batch = torch.clamp(
-                batch["user"].n_id, min=0, max=dataset_dict["num_users"] - 1,
-            )
-            b_minilm = minilm_full[g_users_batch]
-            b_scalar = scalar_full[g_users_batch]
-
-            out = model(x_batch, safe_ei, b_minilm, b_scalar, ew)
-
-            pos_edges, neg_edges, n_bpr = _extract_bpr_edges(batch)
-            if n_bpr == 0:
-                continue
-
-            max_u = max(0, out["user"].size(0) - 1)
-            max_i = max(0, out["item"].size(0) - 1)
-            u_loc = torch.clamp(pos_edges[0], min=0, max=max_u)
-            pi_loc = torch.clamp(pos_edges[1], min=0, max=max_i)
-            ni_loc = torch.clamp(neg_edges[1], min=0, max=max_i)
-
-            user_feat = out["user"][u_loc]
-            pos_feat = out["item"][pi_loc]
-            neg_feat = out["item"][ni_loc]
-
-            # BPR
-            pos_scores = (user_feat * pos_feat).sum(dim=1)
-            neg_scores = (user_feat * neg_feat).sum(dim=1)
-            loss_link = -F.logsigmoid(pos_scores - neg_scores).mean()
-
-            # MTL auxiliary
-            p_hat = model.aux_head(out["user"])
-            p_true = proxies_full[g_users_batch]
-            variance = p_true.var()
-            loss_aux = F.mse_loss(p_hat, p_true) / variance if variance > 0 else F.mse_loss(p_hat, p_true)
-
-            loss = loss_link + lambda_aux * loss_aux
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-            optimizer.step()
-            epoch_loss += loss.item()
-            pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
-
-        # Periodic validation
-        if epoch % 5 == 0 or dry_run or epoch == 1:
-            model.eval()
-            with torch.no_grad():
-                out_eval = _full_forward(
-                    model, data, device,
-                    needs_side_info=True,
-                    minilm_vec=minilm_full, scalar_vec=scalar_full,
-                )
-
-            cur_ndcg = val_ndcg_full(
-                out_eval["user"], out_eval["item"],
-                dataset_dict["train_edge_index"].to(device),
-                dataset_dict["val_dict"], k=10,
-            )
-            print(f"  Epoch [{epoch}/{epochs}] | Loss: {epoch_loss:.4f} | Val NDCG@10: {cur_ndcg:.4f}")
-
-            if cur_ndcg > best_val_ndcg:
-                best_val_ndcg = cur_ndcg
-                best_model_state = copy.deepcopy(model.state_dict())
-                patience = 0
-            else:
-                patience += 1
-
-            if patience >= 10:
-                print("  [Early Stopping] Patience reached.")
-                break
-
-    print(f"Baseline Finished | Time: {time.time() - t0:.1f}s | Best Val NDCG@10: {best_val_ndcg:.4f}")
-
-    model.load_state_dict(best_model_state)
-    model.eval()
-    with torch.no_grad():
-        out_eval = _full_forward(
-            model, data, device,
-            needs_side_info=True,
-            minilm_vec=minilm_full, scalar_vec=scalar_full,
-        )
-
-    return evaluate_full(
-        out_eval["user"], out_eval["item"],
-        dataset_dict["train_edge_index"].to(device),
-        dataset_dict["val_dict"], dataset_dict["test_dict"],
-        k_list=(10, 20),
-    ), None
